@@ -1,7 +1,7 @@
 /*
-    fm_transmitter - use Raspberry Pi as FM transmitter
+    FM Transmitter - use Raspberry Pi as FM transmitter
 
-    Copyright (c) 2015, Marcin Kondej
+    Copyright (c) 2021, Marcin Kondej
     All rights reserved.
 
     See https://github.com/markondej/fm_transmitter
@@ -31,163 +31,189 @@
     WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-#include "wave_reader.h"
-#include "error_reporter.h"
-#include <sstream>
-#include <string.h>
+#include "wave_reader.hpp"
+#include <stdexcept>
+#include <cstring>
+#include <thread>
+#include <chrono>
+#include <unistd.h>
+#include <fcntl.h>
+#include <climits>
 
-using std::ostringstream;
-using std::exception;
-
-WaveReader::WaveReader(string filename) :
-    filename(filename)
+Sample::Sample(uint8_t *data, unsigned channels, unsigned bitsPerChannel)
+    : value(0.f)
 {
-    char* headerData;
-    vector<char>* data;
-    unsigned bytesToRead, headerOffset;
-    ostringstream oss;
+    uint32_t sum = 0;
+    for (unsigned i = 0; i < channels; i++) {
+        switch (bitsPerChannel >> 3) {
+        case 2:
+            sum += *reinterpret_cast<int16_t *>(&data[i << 1]);
+            break;
+        case 1:
+            sum += (static_cast<int16_t>(data[i]) - 0x80) << 8;
+            break;
+        }
+    }
+    value = sum / (-static_cast<float>(SHRT_MIN) * channels);
+}
 
-    ifs.open(filename.c_str(), ifstream::binary);
-    headerData = (char*)((void*)&header);
+float Sample::GetMonoValue() const
+{
+    return value;
+}
 
-    if (!ifs.is_open()) {
-        oss << "Cannot open " << filename << ", file does not exist";
-        throw ErrorReporter(oss.str());
+WaveReader::WaveReader(const std::string &filename, bool &enable, std::mutex &mtx) :
+    filename(filename), headerOffset(0), currentDataOffset(0)
+{
+    if (!filename.empty()) {
+        fd = open(filename.c_str(), O_RDONLY);
+    } else {
+        fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL, 0) | O_NONBLOCK);
+        fd = STDIN_FILENO;
     }
 
-    ifs.seekg(0, ifs.end);
-    fileSize = ifs.tellg();
-    ifs.seekg(0, ifs.beg);
+    if (fd == -1) {
+        throw std::runtime_error(std::string("Cannot open ") + GetFilename() + std::string(", file does not exist"));
+    }
 
     try {
-        bytesToRead = sizeof(PCMWaveHeader::chunkID) + sizeof(PCMWaveHeader::chunkSize) + sizeof(PCMWaveHeader::format);
-        data = readData(bytesToRead, true);
-        memcpy(headerData, &(*data)[0], bytesToRead);
-        headerOffset = bytesToRead;
-        delete data;
-
-        if ((string(header.chunkID, 4) != string("RIFF")) || (string(header.format, 4) != string("WAVE"))) {
-            oss << "Error while opening " << filename << ", WAVE file expected";
-            throw ErrorReporter(oss.str());
+        ReadData(sizeof(WaveHeader::chunkID) + sizeof(WaveHeader::chunkSize) + sizeof(WaveHeader::format), true, enable, mtx);
+        if ((std::string(reinterpret_cast<char *>(header.chunkID), 4) != std::string("RIFF")) || (std::string(reinterpret_cast<char *>(header.format), 4) != std::string("WAVE"))) {
+            throw std::runtime_error("Error while reading " + GetFilename() + ", WAVE file expected");
         }
 
-        bytesToRead = sizeof(PCMWaveHeader::subchunk1ID) + sizeof(PCMWaveHeader::subchunk1Size);
-        data = readData(bytesToRead, true);
-        memcpy(&headerData[headerOffset], &(*data)[0], bytesToRead);
-        headerOffset += bytesToRead;
-        delete data;
-
-        unsigned subchunk1MinSize = sizeof(PCMWaveHeader) - headerOffset - sizeof(PCMWaveHeader::subchunk2ID) - sizeof(PCMWaveHeader::subchunk2Size);
-        if ((string(header.subchunk1ID, 4) != string("fmt ")) || (header.subchunk1Size < subchunk1MinSize)) {
-            oss << "Error while opening " << filename << ", data corrupted";
-            throw ErrorReporter(oss.str());
+        ReadData(sizeof(WaveHeader::subchunk1ID) + sizeof(WaveHeader::subchunk1Size), true, enable, mtx);
+        unsigned subchunk1MinSize = sizeof(WaveHeader::audioFormat) + sizeof(WaveHeader::channels) +
+            sizeof(WaveHeader::sampleRate) + sizeof(WaveHeader::byteRate) + sizeof(WaveHeader::blockAlign) +
+            sizeof(WaveHeader::bitsPerSample);
+        if ((std::string(reinterpret_cast<char *>(header.subchunk1ID), 4) != std::string("fmt ")) || (header.subchunk1Size < subchunk1MinSize)) {
+            throw std::runtime_error("Error while reading " + GetFilename() + ", data corrupted");
         }
 
-        data = readData(header.subchunk1Size, true);
-        memcpy(&headerData[headerOffset], &(*data)[0], subchunk1MinSize);
-        headerOffset += subchunk1MinSize;
-        delete data;
-
+        ReadData(header.subchunk1Size, true, enable, mtx);
         if ((header.audioFormat != WAVE_FORMAT_PCM) ||
             (header.byteRate != (header.bitsPerSample >> 3) * header.channels * header.sampleRate) ||
             (header.blockAlign != (header.bitsPerSample >> 3) * header.channels) ||
             (((header.bitsPerSample >> 3) != 1) && ((header.bitsPerSample >> 3) != 2))) {
-            oss << "Error while opening " << filename << ", unsupported WAVE format";
-            throw ErrorReporter(oss.str());
+            throw std::runtime_error("Error while reading " + GetFilename() + ", unsupported WAVE format");
         }
 
-        bytesToRead = sizeof(PCMWaveHeader::subchunk2ID) + sizeof(PCMWaveHeader::subchunk2Size);
-        data = readData(bytesToRead, true);
-        memcpy(&headerData[headerOffset], &(*data)[0], bytesToRead);
-        headerOffset += bytesToRead;
-        delete data;
-
-        if ((string(header.subchunk2ID, 4) != string("data")) || (header.subchunk2Size + ifs.tellg() < fileSize)) {
-            oss << "Error while opening " << filename << ", data corrupted";
-            throw ErrorReporter(oss.str());
+        ReadData(sizeof(WaveHeader::subchunk2ID) + sizeof(WaveHeader::subchunk2Size), true, enable, mtx);
+        if (std::string(reinterpret_cast<char *>(header.subchunk2ID), 4) != std::string("data")) {
+            throw std::runtime_error("Error while opening " + GetFilename() + ", data corrupted");
         }
-    } catch (ErrorReporter &error) {
-        ifs.close();
-        throw error;
+    } catch (...) {
+        if (fd != STDIN_FILENO) {
+            close(fd);
+        }
+        throw;
     }
 
-    dataOffset = ifs.tellg();
+    if (fd != STDIN_FILENO) {
+        dataOffset = lseek(fd, 0, SEEK_CUR);
+    }
 }
 
 WaveReader::~WaveReader()
 {
-    ifs.close();
+    if (fd != STDIN_FILENO) {
+        close(fd);
+    }
 }
 
-vector<char>* WaveReader::readData(unsigned bytesToRead, bool closeFileOnException)
+std::string WaveReader::GetFilename() const
 {
-    if (fileSize < (unsigned)ifs.tellg() + bytesToRead) {
-        ostringstream oss;
-        oss << "Error while reading " << filename << ", data corrupted";
-        if (closeFileOnException) ifs.close();
-        throw ErrorReporter(oss.str());
-    }
-
-    vector<char>* data = new vector<char>();
-    data->resize(bytesToRead);
-    ifs.read(&(*data)[0], bytesToRead);
-    return data;
+    return fd != STDIN_FILENO ? filename : "STDIN";
 }
 
-vector<float>* WaveReader::getFrames(unsigned frameCount, unsigned frameOffset) {
-    unsigned bytesToRead, bytesLeft, bytesPerFrame, offset;
-    vector<float>* frames = new vector<float>();
-    vector<char>* data;
+const WaveHeader &WaveReader::GetHeader() const
+{
+    return header;
+}
 
-    bytesPerFrame = (header.bitsPerSample >> 3) * header.channels;
-    bytesToRead = frameCount * bytesPerFrame;
-    bytesLeft = header.subchunk2Size - frameOffset * bytesPerFrame;
-
+std::vector<Sample> WaveReader::GetSamples(unsigned quantity, bool &enable, std::mutex &mtx) {
+    unsigned bytesPerSample = (header.bitsPerSample >> 3) * header.channels;
+    unsigned bytesToRead = quantity * bytesPerSample;
+    unsigned bytesLeft = header.subchunk2Size - currentDataOffset;
     if (bytesToRead > bytesLeft) {
-        bytesToRead = bytesLeft - bytesLeft % bytesPerFrame;
-        frameCount = bytesToRead / bytesPerFrame;
+        bytesToRead = bytesLeft - bytesLeft % bytesPerSample;
+        quantity = bytesToRead / bytesPerSample;
     }
 
-    ifs.seekg(dataOffset + frameOffset * bytesPerFrame);
-
-    try {
-        data = readData(bytesToRead, false);
-    } catch (ErrorReporter &error) {
-        delete frames;
-        throw error;
+    std::vector<uint8_t> data = ReadData(bytesToRead, false, enable, mtx);
+    if (data.size() < bytesToRead) {
+        quantity = data.size() / bytesPerSample;
     }
-    for (unsigned i = 0; i < frameCount; i++) {
-        offset = bytesPerFrame * i;
-        if (header.channels != 1) {
-            if (header.bitsPerSample != 8) {
-                frames->push_back(((int)(signed char)(*data)[offset + 1] + (int)(signed char)(*data)[offset + 3]) / (float)0x100);
-            } else {
-                frames->push_back(((int)(*data)[offset] + (int)(*data)[offset + 1]) / (float)0x100 - 1.0f);
+
+    std::vector<Sample> samples;
+    samples.reserve(quantity);
+    for (unsigned i = 0; i < quantity; i++) {
+        samples.push_back(Sample(&data[bytesPerSample * i], header.channels, header.bitsPerSample));
+    }
+    return samples;
+}
+
+bool WaveReader::SetSampleOffset(unsigned offset) {
+    if (fd != STDIN_FILENO) {
+        currentDataOffset = offset * (header.bitsPerSample >> 3) * header.channels;
+        if (lseek(fd, dataOffset + currentDataOffset, SEEK_SET) == -1) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<uint8_t> WaveReader::ReadData(unsigned bytesToRead, bool headerBytes, bool &enable, std::mutex &mtx)
+{
+    unsigned bytesRead = 0;
+    std::vector<uint8_t> data;
+    data.resize(bytesToRead);
+
+    while (bytesRead < bytesToRead) {
+        std::unique_lock<std::mutex> unique(mtx);
+        if (!enable) {
+            if (headerBytes) {
+                throw std::runtime_error("Failed to read header, operation aborted");
             }
-        } else {
-            if (header.bitsPerSample != 8) {
-                frames->push_back((signed char)(*data)[offset + 1] / (float)0x80);
+            data.resize(bytesRead);
+            break;
+        }
+        unique.unlock();
+        int bytes = read(fd, &data[bytesRead], bytesToRead - bytesRead);
+        if ((bytes == -1) && (errno != EAGAIN) && (errno != EINTR)) {
+            throw std::runtime_error("Error while reading " + GetFilename() + ", operation failed");
+        }
+        if (bytes > 0) {
+            bytesRead += bytes;
+        }
+        if (bytesRead < bytesToRead) {
+            if (fd != STDIN_FILENO) {
+                data.resize(bytesRead);
+                break;
             } else {
-                frames->push_back((*data)[offset] / (float)0x80 - 1.0f);
+                timeval timeout = { .tv_sec = 1, };
+
+                fd_set fds;
+                FD_ZERO(&fds);
+                FD_SET(STDIN_FILENO, &fds);
+                select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &timeout);
+                if (!FD_ISSET(STDIN_FILENO, &fds)) {
+                    data.resize(bytesRead);
+                    break;
+                }
             }
         }
     }
 
-    delete data;
+    if (headerBytes) {
+        if (bytesRead < bytesToRead) {
+            throw std::runtime_error("Failed to read header, data corrupted");
+        }
+        std::memcpy(&(reinterpret_cast<uint8_t *>(&header))[headerOffset], data.data(), bytesRead);
+        headerOffset += bytesRead;
+    } else {
+        currentDataOffset += bytesRead;
+    }
 
-    return frames;
-}
-
-bool WaveReader::isEnd(unsigned frameOffset)
-{
-    return header.subchunk2Size <= frameOffset * (header.bitsPerSample >> 3) * header.channels;
-}
-
-AudioFormat* WaveReader::getFormat()
-{
-    AudioFormat* format = new AudioFormat;
-    format->channels = header.channels;
-    format->sampleRate = header.sampleRate;
-    format->bitsPerSample = header.bitsPerSample;
-    return format;
+    return data;
 }
